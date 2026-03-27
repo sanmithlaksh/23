@@ -1,0 +1,707 @@
+import { useEffect, useRef, useState } from 'react';
+import { useGame } from '../context/GameContext';
+import { saveProgress } from '../supabase';
+import { showFlash } from '../components/Flash';
+import ProgressTrack from '../components/ProgressTrack';
+
+// ── Maze generator (recursive backtracker) ──────────────────
+function generateMaze(cols, rows) {
+  const cells = Array.from({ length: rows }, (_, r) =>
+    Array.from({ length: cols }, (_, c) => ({
+      r, c, walls: { N: true, S: true, E: true, W: true }, visited: false,
+    }))
+  );
+  function neighbors(r, c) {
+    const ns = [];
+    if (r > 0      && !cells[r-1][c].visited) ns.push({ r:r-1, c, dir:'N', opp:'S' });
+    if (r < rows-1 && !cells[r+1][c].visited) ns.push({ r:r+1, c, dir:'S', opp:'N' });
+    if (c > 0      && !cells[r][c-1].visited) ns.push({ r, c:c-1, dir:'W', opp:'E' });
+    if (c < cols-1 && !cells[r][c+1].visited) ns.push({ r, c:c+1, dir:'E', opp:'W' });
+    return ns;
+  }
+  const stack = [cells[0][0]]; cells[0][0].visited = true;
+  while (stack.length) {
+    const cur = stack[stack.length - 1];
+    const ns  = neighbors(cur.r, cur.c).filter(n => !cells[n.r][n.c].visited);
+    if (ns.length) {
+      const next = ns[Math.floor(Math.random() * ns.length)];
+      cells[cur.r][cur.c].walls[next.dir] = false;
+      cells[next.r][next.c].walls[next.opp] = false;
+      cells[next.r][next.c].visited = true;
+      stack.push(cells[next.r][next.c]);
+    } else { stack.pop(); }
+  }
+  return cells;
+}
+
+// BFS shortest path — forbidden is a Set of "r,c" strings bots must avoid
+function bfsPath(cells, rows, cols, sr, sc, er, ec, forbidden = new Set()) {
+  const visited = Array.from({length:rows}, ()=>Array(cols).fill(false));
+  const prev    = Array.from({length:rows}, ()=>Array(cols).fill(null));
+  const queue   = [{r:sr,c:sc}];
+  visited[sr][sc] = true;
+  const dirs = [{dr:-1,dc:0,wall:'N'},{dr:1,dc:0,wall:'S'},{dr:0,dc:1,wall:'E'},{dr:0,dc:-1,wall:'W'}];
+  while (queue.length) {
+    const cur = queue.shift();
+    if (cur.r===er && cur.c===ec) break;
+    for (const d of dirs) {
+      const nr=cur.r+d.dr, nc=cur.c+d.dc;
+      if (nr>=0&&nr<rows&&nc>=0&&nc<cols&&!visited[nr][nc]&&
+          !cells[cur.r][cur.c].walls[d.wall]&&!forbidden.has(`${nr},${nc}`)) {
+        visited[nr][nc]=true; prev[nr][nc]={r:cur.r,c:cur.c}; queue.push({r:nr,c:nc});
+      }
+    }
+  }
+  const path=[]; let cur={r:er,c:ec};
+  while (cur&&!(cur.r===sr&&cur.c===sc)) { path.unshift(cur); cur=prev[cur.r][cur.c]; }
+  return path;
+}
+
+// Spawn zones bots must never enter — top-left 2x2 (P1) and bottom-right 2x2 (P2)
+function getSpawnForbidden(ROWS, COLS) {
+  const f = new Set();
+  // P1 spawn zone
+  for (let r=0;r<2;r++) for (let c=0;c<2;c++) f.add(`${r},${c}`);
+  // P2 spawn zone
+  for (let r=ROWS-2;r<ROWS;r++) for (let c=COLS-2;c<COLS;c++) f.add(`${r},${c}`);
+  return f;
+}
+
+// Normal controls: W=up, S=down, A=left, D=right | Arrows normal
+const KEY_MAP = {
+  w:[-1,0], W:[-1,0],
+  s:[1,0],  S:[1,0],
+  a:[0,-1], A:[0,-1],
+  d:[0,1],  D:[0,1],
+  ArrowUp:[-1,0], ArrowDown:[1,0], ArrowLeft:[0,-1], ArrowRight:[0,1],
+};
+const P1_KEYS = new Set(['w','W','s','S','a','A','d','D']);
+const P2_KEYS = new Set(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight']);
+
+// ── Fragment Completion Overlay ────────────────────────────
+function FragmentOverlay({ fragment, onNext }) {
+  const [phase, setPhase] = useState('enter'); // enter → show → exit
+
+  useEffect(() => {
+    const t1 = setTimeout(() => setPhase('show'), 100);
+    const t2 = setTimeout(() => setPhase('exit'), 3800);
+    const t3 = setTimeout(() => onNext(), 4500);
+    return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); };
+  }, []);
+
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, zIndex: 9999,
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      background: phase === 'exit'
+        ? 'rgba(0,0,0,0)'
+        : phase === 'show'
+          ? 'rgba(0,0,0,0.88)'
+          : 'rgba(0,0,0,0)',
+      transition: 'background 0.6s ease',
+      pointerEvents: phase === 'exit' ? 'none' : 'all',
+    }}>
+      <div style={{
+        textAlign: 'center',
+        opacity: phase === 'show' ? 1 : 0,
+        transform: phase === 'exit'
+          ? 'translate(80vw, -40vh) scale(0.15)'
+          : phase === 'show'
+            ? 'translate(0,0) scale(1)'
+            : 'translateY(40px) scale(0.9)',
+        transition: phase === 'exit'
+          ? 'all 0.7s cubic-bezier(0.4,0,1,1)'
+          : 'all 0.6s cubic-bezier(0.16,1,0.3,1)',
+      }}>
+        {/* Vault SVG */}
+        <div style={{ marginBottom: '1.5rem', position: 'relative', display: 'inline-block' }}>
+          <svg width="160" height="160" viewBox="0 0 160 160">
+            {/* Outer ring */}
+            <circle cx="80" cy="80" r="72" fill="none" stroke="rgba(201,168,76,0.3)" strokeWidth="2"/>
+            <circle cx="80" cy="80" r="72" fill="none" stroke="rgba(201,168,76,0.8)" strokeWidth="1.5"
+              strokeDasharray="452" strokeDashoffset="0"
+              style={{ animation: 'vaultRingDraw 1.2s ease forwards' }}
+            />
+            {/* Vault door */}
+            <circle cx="80" cy="80" r="58" fill="rgba(10,10,20,0.95)" stroke="rgba(201,168,76,0.6)" strokeWidth="2.5"/>
+            {/* Spokes */}
+            {[0,45,90,135,180,225,270,315].map((deg,i) => (
+              <line key={i}
+                x1="80" y1="80"
+                x2={80 + Math.cos(deg*Math.PI/180)*52}
+                y2={80 + Math.sin(deg*Math.PI/180)*52}
+                stroke="rgba(201,168,76,0.35)" strokeWidth="1.5"
+              />
+            ))}
+            {/* Center lock */}
+            <circle cx="80" cy="80" r="18" fill="rgba(201,168,76,0.12)" stroke="rgba(201,168,76,0.9)" strokeWidth="2"/>
+            <circle cx="80" cy="80" r="8" fill="rgba(201,168,76,0.7)"/>
+            {/* Glow */}
+            <circle cx="80" cy="80" r="58" fill="none" stroke="rgba(201,168,76,0.15)" strokeWidth="20"
+              style={{ animation: 'vaultPulse 2s ease-in-out infinite' }}
+            />
+          </svg>
+          {/* Scanline overlay */}
+          <div style={{
+            position: 'absolute', inset: 0, borderRadius: '50%',
+            background: 'repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,255,100,0.03) 3px,rgba(0,255,100,0.03) 4px)',
+            pointerEvents: 'none',
+          }}/>
+        </div>
+
+        <div style={{ fontFamily: 'Cinzel, serif', fontSize: '0.68rem', letterSpacing: '0.3em', color: '#00aa55', textTransform: 'uppercase', marginBottom: '0.6rem' }}>
+          ⬡ VAULT FRAGMENT ACQUIRED
+        </div>
+        <div style={{
+          fontFamily: 'Cinzel, serif',
+          fontSize: '2.4rem',
+          letterSpacing: '0.4em',
+          color: 'var(--gold)',
+          textShadow: '0 0 30px rgba(201,168,76,0.8), 0 0 60px rgba(201,168,76,0.4)',
+          marginBottom: '0.5rem',
+        }}>
+          {fragment}
+        </div>
+        <div style={{ fontFamily: 'Share Tech Mono, monospace', fontSize: '0.72rem', color: '#446', letterSpacing: '0.2em' }}>
+          FIREWALL BREACHED — FRAGMENT 2 SECURED
+        </div>
+      </div>
+
+      <style>{`
+        @keyframes vaultRingDraw {
+          from { stroke-dashoffset: 452; opacity: 0.2; }
+          to   { stroke-dashoffset: 0;   opacity: 1;   }
+        }
+        @keyframes vaultPulse {
+          0%,100% { opacity: 0.1; }
+          50%      { opacity: 0.5; }
+        }
+      `}</style>
+    </div>
+  );
+}
+
+export default function Round2Screen({ audio }) {
+  const { config, team, collectFragment, setScreen, getElapsedNow } = useGame();
+  const [showOverlay, setShowOverlay] = useState(false);
+  const [complete,    setComplete]    = useState(false);
+
+  // Bot speed from config (1-10), default 5
+  const botSpeed = config.r2BotSpeed ?? 5;
+  // Player speed from config (1-10), default 5
+  const playerSpeed = config.r2PlayerSpeed ?? 5;
+
+  async function handleComplete() {
+    if (complete) return;
+    setComplete(true);
+    collectFragment(1, config.fragments[1]);
+    audio?.playSuccess?.();
+    setShowOverlay(true);
+    if (team) await saveProgress(team.id, { currentRound: 3, fragment2: config.fragments[1], elapsedSeconds: getElapsedNow() });
+  }
+
+  return (
+    <div className="screen screen-padded" style={{ padding: '0.5rem', overflow: 'hidden' }}>
+      {showOverlay && (
+        <FragmentOverlay
+          fragment={config.fragments[1]}
+          onNext={() => {
+            setShowOverlay(false);
+            showFlash(`Fragment 2 unlocked: ${config.fragments[1]}`, 'info', 3000);
+          }}
+        />
+      )}
+
+      <div className="panel panel-lg" style={{ padding: '0.75rem 1rem' }}>
+        <h2 style={{ marginBottom: '0.2rem' }}>ROUND 2 — MAZE SYSTEM</h2>
+        <p className="subtitle" style={{ marginBottom: '0.5rem' }}>
+          Two agents. One labyrinth. Converge on the center.
+        </p>
+        <ProgressTrack current={2} />
+
+        <DualPlayerMaze
+          audio={audio}
+          botSpeed={botSpeed}
+          playerSpeed={playerSpeed}
+          onComplete={handleComplete}
+        />
+
+        {complete && !showOverlay && (
+          <>
+            <div className="frag-reveal" style={{ marginTop: '0.75rem' }}>
+              <div className="frag-label">⬡ Firewall Breached — Vault Fragment 2 Acquired</div>
+              <div className="frag-value">{config.fragments[1]}</div>
+            </div>
+            <div style={{ textAlign: 'center', marginTop: '0.75rem' }}>
+              <button className="btn btn-primary" onClick={() => setScreen('r3')}>
+                ADVANCE TO ROUND 3 — SYSTEM RECONSTRUCTION →
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════
+//  DUAL-PLAYER MAZE — full-screen canvas, smooth interpolated movement
+// ════════════════════════════════════════════════════════════
+function DualPlayerMaze({ audio, botSpeed, playerSpeed, onComplete }) {
+  const COLS = 31, ROWS = 21;
+  const EXIT_R = Math.floor(ROWS / 2);
+  const EXIT_C = Math.floor(COLS / 2);
+
+  const canvasRef  = useRef(null);
+  const stateRef   = useRef(null); // all game state in one ref for rAF access
+  const rafRef     = useRef(null);
+  const frameRef   = useRef(0);
+  const doneRef    = useRef(false);
+
+  const [restarts, setRestarts] = useState(0);
+  const [done,     setDone]     = useState(false);
+  const [hitFlash, setHitFlash] = useState(false);
+  const [p1Exit,   setP1Exit]   = useState(false);
+  const [p2Exit,   setP2Exit]   = useState(false);
+  const [cellSize, setCellSize] = useState(26);
+  const lastMoveRef = useRef({ p1: 0, p2: 0 }); // for player speed throttle
+
+  // Bot frame interval derived from speed 1-10: speed 1 = 40 frames, speed 10 = 6 frames
+  const botInterval = Math.round(40 - (botSpeed - 1) * (34 / 9));
+  // Player move cooldown: speed 1 = 350ms, speed 10 = 80ms
+  const playerCooldown = Math.round(350 - (playerSpeed - 1) * (270 / 9));
+
+  useEffect(() => {
+    function resize() {
+      const maxW = window.innerWidth - 40;
+      const maxH = window.innerHeight - 280;
+      const cs = Math.max(14, Math.min(34, Math.floor(Math.min(maxW / COLS, maxH / ROWS))));
+      setCellSize(cs);
+    }
+    resize();
+    window.addEventListener('resize', resize);
+    return () => window.removeEventListener('resize', resize);
+  }, []);
+
+  // Init / reinit on cellSize change
+  useEffect(() => {
+    const C = cellSize;
+    const cells = generateMaze(COLS, ROWS);
+
+    // Smooth position: grid pos + pixel interpolation
+    const FORBIDDEN = getSpawnForbidden(ROWS, COLS);
+    const initState = () => ({
+      cells,
+      forbidden: FORBIDDEN,
+      p1: { r:0, c:0, px:C/2, py:C/2, tx:C/2, ty:C/2, dir:'E', trail:[], mouth:{a:0.1,opening:true} },
+      p2: { r:ROWS-1, c:COLS-1, px:(COLS-1)*C+C/2, py:(ROWS-1)*C+C/2, tx:(COLS-1)*C+C/2, ty:(ROWS-1)*C+C/2, dir:'W', trail:[], mouth:{a:0.1,opening:true} },
+      // Bots start at opposite corners away from spawn zones
+      b1: { r:3, c:COLS-4, px:(COLS-4)*C+C/2, py:3*C+C/2, tx:(COLS-4)*C+C/2, ty:3*C+C/2, path:[], idx:0, hue:0 },
+      b2: { r:ROWS-4, c:3, px:3*C+C/2, py:(ROWS-4)*C+C/2, tx:3*C+C/2, ty:(ROWS-4)*C+C/2, path:[], idx:0, hue:0 },
+      exitPulse: 0,
+    });
+
+    stateRef.current = initState();
+    rerouteBots();
+
+    doneRef.current = false;
+    frameRef.current = 0;
+    cancelAnimationFrame(rafRef.current);
+    rafRef.current = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [cellSize]);
+
+  function rerouteBots() {
+    const s = stateRef.current; if (!s) return;
+    const forbidden = s.forbidden || new Set();
+    // Bots path toward players but never enter spawn forbidden zones
+    s.b1.path = bfsPath(s.cells, ROWS, COLS, s.b1.r, s.b1.c, s.p1.r, s.p1.c, forbidden);
+    s.b1.idx  = 0;
+    s.b2.path = bfsPath(s.cells, ROWS, COLS, s.b2.r, s.b2.c, s.p2.r, s.p2.c, forbidden);
+    s.b2.idx  = 0;
+  }
+
+  function loop() {
+    const f = ++frameRef.current;
+    if (f % botInterval === 0) moveBots();
+    updateInterp();
+    draw();
+    rafRef.current = requestAnimationFrame(loop);
+  }
+
+  // Smooth interpolation toward target
+  function updateInterp() {
+    const s = stateRef.current; if (!s) return;
+    const LERP = 0.22;
+    for (const ent of [s.p1, s.p2, s.b1, s.b2]) {
+      ent.px += (ent.tx - ent.px) * LERP;
+      ent.py += (ent.ty - ent.py) * LERP;
+    }
+    s.exitPulse = (s.exitPulse + 0.04) % (Math.PI * 2);
+  }
+
+  function moveBots() {
+    const s = stateRef.current; if (!s || doneRef.current) return;
+    moveSingleBot(s.b1, s.p1);
+    moveSingleBot(s.b2, s.p2);
+  }
+
+  function moveSingleBot(bot, target) {
+    const s = stateRef.current;
+    const C = cellSize;
+    const forbidden = s.forbidden || new Set();
+    // Reroute every 4 steps
+    if (bot.idx >= bot.path.length || bot.idx % 4 === 0) {
+      bot.path = bfsPath(s.cells, ROWS, COLS, bot.r, bot.c, target.r, target.c, forbidden);
+      bot.idx = 0;
+    }
+    if (!bot.path.length) return;
+    const next = bot.path[bot.idx];
+    if (!next) return;
+    // Double-check: never enter a forbidden spawn cell
+    if (forbidden.has(`${next.r},${next.c}`)) { bot.idx++; return; }
+    bot.r = next.r; bot.c = next.c;
+    bot.tx = next.c * C + C/2;
+    bot.ty = next.r * C + C/2;
+    bot.idx++;
+    bot.hue = (bot.hue + 3) % 360;
+    checkCollision();
+  }
+
+  function checkCollision() {
+    const s = stateRef.current; if (!s || doneRef.current) return;
+    const {p1,p2,b1,b2} = s;
+    const hit = (b1.r===p1.r&&b1.c===p1.c)||(b1.r===p2.r&&b1.c===p2.c)||
+                (b2.r===p1.r&&b2.c===p1.c)||(b2.r===p2.r&&b2.c===p2.c);
+    if (hit) handleHit();
+  }
+
+  function handleHit() {
+    if (doneRef.current) return;
+    const s = stateRef.current; if (!s) return;
+    audio?.playBotHit?.();
+    const C = cellSize;
+    // Reset players to spawn
+    s.p1 = { ...s.p1, r:0, c:0, px:C/2, py:C/2, tx:C/2, ty:C/2, dir:'E', trail:[] };
+    s.p2 = { ...s.p2, r:ROWS-1, c:COLS-1, px:(COLS-1)*C+C/2, py:(ROWS-1)*C+C/2, tx:(COLS-1)*C+C/2, ty:(ROWS-1)*C+C/2, dir:'W', trail:[] };
+    // Move bots back to their safe starting positions (away from spawns)
+    s.b1.r = 3; s.b1.c = COLS-4; s.b1.px = (COLS-4)*C+C/2; s.b1.py = 3*C+C/2; s.b1.tx = s.b1.px; s.b1.ty = s.b1.py;
+    s.b2.r = ROWS-4; s.b2.c = 3; s.b2.px = 3*C+C/2; s.b2.py = (ROWS-4)*C+C/2; s.b2.tx = s.b2.px; s.b2.ty = s.b2.py;
+    // Reset move timestamps so players can move immediately after respawn
+    lastMoveRef.current = { p1: 0, p2: 0 };
+    rerouteBots();
+    setHitFlash(true);
+    setRestarts(p => p+1);
+    setP1Exit(false);
+    setP2Exit(false);
+    setTimeout(() => setHitFlash(false), 800);
+  }
+
+  function tryMove(which, dr, dc) {
+    if (doneRef.current) return;
+    const s = stateRef.current; if (!s) return;
+    const C = cellSize;
+
+    // Player speed throttle
+    const now = Date.now();
+    const pKey = which === 1 ? 'p1' : 'p2';
+    if (now - lastMoveRef.current[pKey] < playerCooldown) return;
+    lastMoveRef.current[pKey] = now;
+
+    const p = which === 1 ? s.p1 : s.p2;
+    const dirMap = {'-10':'N','10':'S','01':'E','0-1':'W'};
+    const dirKey = dirMap[`${dr}${dc}`];
+    if (!dirKey) return;
+    if (s.cells[p.r][p.c].walls[dirKey]) { audio?.playWallHit?.(); return; }
+    const nr = p.r + dr, nc = p.c + dc;
+    if (nr<0||nr>=ROWS||nc<0||nc>=COLS) return;
+
+    // Push trail
+    p.trail = [...(p.trail||[]).slice(-6), {x:p.tx, y:p.ty}];
+    p.r = nr; p.c = nc;
+    p.tx = nc * C + C/2;
+    p.ty = nr * C + C/2;
+    p.dir = dirKey;
+    audio?.playClick?.();
+
+    checkCollision();
+
+    const isP1Exit = s.p1.r===EXIT_R&&s.p1.c===EXIT_C;
+    const isP2Exit = s.p2.r===EXIT_R&&s.p2.c===EXIT_C;
+    setP1Exit(isP1Exit);
+    setP2Exit(isP2Exit);
+    if (isP1Exit && isP2Exit && !doneRef.current) {
+      doneRef.current = true;
+      setDone(true);
+      audio?.playLevelComplete?.();
+      setTimeout(onComplete, 600);
+    }
+  }
+
+  useEffect(() => {
+    function handler(e) {
+      const mv = KEY_MAP[e.key];
+      if (!mv) return;
+      e.preventDefault();
+      if (P1_KEYS.has(e.key)) tryMove(1, mv[0], mv[1]);
+      else if (P2_KEYS.has(e.key)) tryMove(2, mv[0], mv[1]);
+    }
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [cellSize]);
+
+  // ── DRAW ─────────────────────────────────────────────────
+  function draw() {
+    const canvas = canvasRef.current; if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const C = cellSize;
+    const s = stateRef.current; if (!s) return;
+
+    ctx.fillStyle = '#05050f';
+    ctx.fillRect(0, 0, COLS*C, ROWS*C);
+
+    // Grid subtle bg lines
+    ctx.strokeStyle = 'rgba(30,30,60,0.5)'; ctx.lineWidth = 0.5;
+    for (let r=0;r<=ROWS;r++) { ctx.beginPath();ctx.moveTo(0,r*C);ctx.lineTo(COLS*C,r*C);ctx.stroke(); }
+    for (let c=0;c<=COLS;c++) { ctx.beginPath();ctx.moveTo(c*C,0);ctx.lineTo(c*C,ROWS*C);ctx.stroke(); }
+
+    // Cells
+    s.cells.forEach((row,r) => row.forEach((cell,c) => {
+      const x=c*C, y=r*C;
+
+      // Exit cell
+      if (r===EXIT_R&&c===EXIT_C) {
+        const pulse = 0.3 + 0.2 * Math.sin(s.exitPulse);
+        const grd = ctx.createRadialGradient(x+C/2,y+C/2,0,x+C/2,y+C/2,C);
+        grd.addColorStop(0, `rgba(0,255,136,${pulse})`);
+        grd.addColorStop(1, 'rgba(0,60,30,0)');
+        ctx.fillStyle = grd;
+        ctx.fillRect(x,y,C,C);
+        ctx.fillStyle = `rgba(0,255,136,${0.7+0.3*Math.sin(s.exitPulse)})`;
+        ctx.font = `bold ${Math.floor(C*0.35)}px 'Courier New', monospace`;
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText('EXIT', x+C/2, y+C/2);
+      }
+
+      // Walls — glowing gold lines
+      ctx.shadowColor = 'rgba(201,168,76,0.4)';
+      ctx.shadowBlur = 3;
+      ctx.strokeStyle = 'rgba(140,110,40,0.85)';
+      ctx.lineWidth = 1.5;
+      if (cell.walls.N){ctx.beginPath();ctx.moveTo(x,y);ctx.lineTo(x+C,y);ctx.stroke();}
+      if (cell.walls.S){ctx.beginPath();ctx.moveTo(x,y+C);ctx.lineTo(x+C,y+C);ctx.stroke();}
+      if (cell.walls.W){ctx.beginPath();ctx.moveTo(x,y);ctx.lineTo(x,y+C);ctx.stroke();}
+      if (cell.walls.E){ctx.beginPath();ctx.moveTo(x+C,y);ctx.lineTo(x+C,y+C);ctx.stroke();}
+      ctx.shadowBlur = 0;
+    }));
+
+    // Trails
+    drawTrail(ctx, s.p1.trail, 'rgba(240,200,110,');
+    drawTrail(ctx, s.p2.trail, 'rgba(100,220,255,');
+
+    // Bots
+    drawBot(ctx, s.b1, C, '#ff3030', '#ff6060');
+    drawBot(ctx, s.b2, C, '#ff6600', '#ffaa44');
+
+    // Players
+    drawPlayer(ctx, s.p1, C, '#f0cc6e', 'P1');
+    drawPlayer(ctx, s.p2, C, '#60e0ff', 'P2');
+
+    // Player labels (names above)
+    drawLabel(ctx, s.p1, C, '#f0cc6e', 'AGENT 1');
+    drawLabel(ctx, s.p2, C, '#60e0ff', 'AGENT 2');
+  }
+
+  function drawTrail(ctx, trail, colorBase) {
+    if (!trail || trail.length < 2) return;
+    for (let i = 0; i < trail.length; i++) {
+      const alpha = (i / trail.length) * 0.35;
+      const size  = (i / trail.length) * 4 + 1;
+      ctx.beginPath();
+      ctx.arc(trail[i].x, trail[i].y, size, 0, Math.PI*2);
+      ctx.fillStyle = `${colorBase}${alpha.toFixed(2)})`;
+      ctx.fill();
+    }
+  }
+
+  function drawBot(ctx, bot, C, innerColor, glowColor) {
+    const bx = bot.px, by = bot.py, br = C/2 - 5;
+
+    // Outer glow ring
+    const grd = ctx.createRadialGradient(bx, by, 0, bx, by, br + 12);
+    grd.addColorStop(0, innerColor + 'cc');
+    grd.addColorStop(0.5, innerColor + '44');
+    grd.addColorStop(1, innerColor + '00');
+    ctx.beginPath(); ctx.arc(bx, by, br+12, 0, Math.PI*2);
+    ctx.fillStyle = grd; ctx.fill();
+
+    // Body
+    ctx.beginPath(); ctx.arc(bx, by, br, 0, Math.PI*2);
+    ctx.fillStyle = innerColor; ctx.fill();
+
+    // Inner shine
+    const shine = ctx.createRadialGradient(bx-br*0.3, by-br*0.3, 0, bx, by, br);
+    shine.addColorStop(0, 'rgba(255,255,255,0.35)');
+    shine.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.beginPath(); ctx.arc(bx, by, br, 0, Math.PI*2);
+    ctx.fillStyle = shine; ctx.fill();
+
+    // Eyes
+    ctx.beginPath(); ctx.arc(bx - br*0.3, by - br*0.2, br*0.2, 0, Math.PI*2);
+    ctx.fillStyle = '#fff'; ctx.fill();
+    ctx.beginPath(); ctx.arc(bx + br*0.3, by - br*0.2, br*0.2, 0, Math.PI*2);
+    ctx.fillStyle = '#fff'; ctx.fill();
+    ctx.beginPath(); ctx.arc(bx - br*0.28, by - br*0.18, br*0.1, 0, Math.PI*2);
+    ctx.fillStyle = '#300'; ctx.fill();
+    ctx.beginPath(); ctx.arc(bx + br*0.32, by - br*0.18, br*0.1, 0, Math.PI*2);
+    ctx.fillStyle = '#300'; ctx.fill();
+
+    // Scan line animation
+    ctx.save();
+    ctx.beginPath(); ctx.arc(bx, by, br, 0, Math.PI*2); ctx.clip();
+    ctx.fillStyle = `rgba(255,255,255,${0.05 + 0.05*Math.sin(frameRef.current*0.1)})`;
+    ctx.fillRect(bx-br, by-br*0.1, br*2, br*0.25);
+    ctx.restore();
+
+    // BOT label below
+    ctx.fillStyle = glowColor;
+    ctx.font = `bold ${Math.max(9,Math.floor(C*0.3))}px 'Courier New', monospace`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    ctx.shadowColor = innerColor; ctx.shadowBlur = 6;
+    ctx.fillText('◆ BOT', bx, by + br + 3);
+    ctx.shadowBlur = 0;
+  }
+
+  function drawPlayer(ctx, p, C, color, label) {
+    const x = p.px, y = p.py, r = C/2 - 5;
+    const m = p.mouth;
+    m.a += m.opening ? 0.13 : -0.13;
+    if (m.a > 0.38) m.opening = false;
+    if (m.a < 0.02) m.opening = true;
+
+    const rotMap = { N:-Math.PI/2, S:Math.PI/2, E:0, W:Math.PI };
+    const rot = rotMap[p.dir] ?? 0;
+
+    ctx.save();
+    ctx.translate(x, y); ctx.rotate(rot);
+    ctx.shadowColor = color; ctx.shadowBlur = 14;
+
+    // Body
+    ctx.beginPath(); ctx.moveTo(0,0);
+    ctx.arc(0, 0, r, m.a, Math.PI*2 - m.a);
+    ctx.closePath();
+    ctx.fillStyle = color;
+    ctx.fill();
+
+    // Inner shine
+    const shine = ctx.createRadialGradient(-r*0.3, -r*0.3, 0, 0, 0, r);
+    shine.addColorStop(0, 'rgba(255,255,255,0.4)');
+    shine.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.beginPath(); ctx.moveTo(0,0);
+    ctx.arc(0, 0, r, m.a, Math.PI*2 - m.a);
+    ctx.closePath();
+    ctx.fillStyle = shine; ctx.fill();
+
+    ctx.shadowBlur = 0;
+    // Eye
+    ctx.beginPath(); ctx.arc(r*0.22, -r*0.38, r*0.13, 0, Math.PI*2);
+    ctx.fillStyle = '#05050f'; ctx.fill();
+    ctx.restore();
+  }
+
+  function drawLabel(ctx, p, C, color, label) {
+    const r = C/2 - 5;
+    ctx.fillStyle = color;
+    ctx.font = `bold ${Math.max(9,Math.floor(C*0.32))}px 'Courier New', monospace`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+    ctx.shadowColor = color; ctx.shadowBlur = 8;
+    ctx.fillText(label, p.px, p.py - r - 2);
+    ctx.shadowBlur = 0;
+  }
+
+  const C = cellSize;
+  const W = COLS * C, H = ROWS * C;
+
+  return (
+    <div style={{ display:'flex', flexDirection:'column', alignItems:'center', width:'100%' }}>
+
+      {/* HUD */}
+      <div style={{ display:'flex', gap:'0.5rem', marginBottom:'0.5rem', width:'100%', justifyContent:'space-between', flexWrap:'wrap' }}>
+        {/* P1 card */}
+        <div style={{ flex:1, minWidth:160, background:'rgba(240,200,110,0.06)', border:`1px solid ${p1Exit?'var(--green)':'rgba(240,200,110,0.3)'}`, padding:'0.5rem 0.75rem', fontFamily:'Share Tech Mono,monospace', fontSize:'0.72rem', transition:'border-color 0.3s' }}>
+          <div style={{ color:'#f0cc6e', letterSpacing:'0.12em', marginBottom:'0.25rem' }}>◈ AGENT 1 — WASD</div>
+          <div style={{ color:'#555', fontSize:'0.62rem' }}>W=↑ &nbsp; S=↓ &nbsp; A=← &nbsp; D=→</div>
+          {p1Exit && <div style={{ color:'var(--green)', marginTop:'0.25rem', fontSize:'0.68rem' }}>✓ AT CENTER EXIT</div>}
+        </div>
+
+        {/* Center stats */}
+        <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', padding:'0.25rem 1rem', fontFamily:'Share Tech Mono,monospace', fontSize:'0.7rem', color:'#444' }}>
+          <div style={{ color: restarts > 0 ? 'var(--red)' : '#333' }}>RESETS: {restarts}</div>
+          {done && <div style={{ color:'var(--green)', fontSize:'0.78rem', letterSpacing:'0.1em' }}>✓ CLEARED</div>}
+        </div>
+
+        {/* P2 card */}
+        <div style={{ flex:1, minWidth:160, background:'rgba(96,224,255,0.06)', border:`1px solid ${p2Exit?'var(--green)':'rgba(96,224,255,0.3)'}`, padding:'0.5rem 0.75rem', fontFamily:'Share Tech Mono,monospace', fontSize:'0.72rem', textAlign:'right', transition:'border-color 0.3s' }}>
+          <div style={{ color:'#60e0ff', letterSpacing:'0.12em', marginBottom:'0.25rem' }}>AGENT 2 — ARROWS ◈</div>
+          <div style={{ color:'#555', fontSize:'0.62rem' }}>↑ &nbsp; ↓ &nbsp; ← &nbsp; →</div>
+          {p2Exit && <div style={{ color:'var(--green)', marginTop:'0.25rem', fontSize:'0.68rem' }}>✓ AT CENTER EXIT</div>}
+        </div>
+      </div>
+
+      {/* Bot hit flash */}
+      {hitFlash && (
+        <div style={{
+          width:'100%', maxWidth:W, marginBottom:'0.4rem',
+          background:'rgba(120,10,10,0.97)', border:'1px solid rgba(255,50,50,0.5)',
+          color:'#ff4444', padding:'0.4rem 0.75rem',
+          fontFamily:'Cinzel,serif', fontSize:'0.78rem', letterSpacing:'0.14em',
+          textAlign:'center', animation:'fadeUp 0.15s ease',
+        }}>
+          ⚠ DRONE INTERCEPT — BOTH AGENTS RESET TO SPAWN
+        </div>
+      )}
+
+      {/* Lore bar */}
+      <div style={{
+        width:'100%', maxWidth:W, marginBottom:'0.4rem',
+        background:'rgba(0,0,10,0.7)', border:'1px solid rgba(201,168,76,0.15)',
+        borderLeft:'3px solid rgba(201,168,76,0.5)',
+        padding:'0.4rem 0.75rem',
+        fontFamily:'Share Tech Mono,monospace', fontSize:'0.68rem', color:'#667',
+        letterSpacing:'0.08em',
+      }}>
+        <span style={{ color:'rgba(201,168,76,0.6)' }}>⬡ VAULT AI: </span>
+        Both agents must reach the CENTER simultaneously. Security drones hunt actively — interception resets both agents.
+      </div>
+
+      {/* Canvas */}
+      <canvas
+        ref={canvasRef}
+        width={W}
+        height={H}
+        style={{
+          width:'100%', maxWidth:W, height:'auto', display:'block',
+          border:'1px solid rgba(201,168,76,0.3)',
+          boxShadow:'0 0 40px rgba(0,0,0,0.95), inset 0 0 60px rgba(0,0,10,0.5)',
+          imageRendering:'pixelated',
+        }}
+      />
+
+      {/* Speed indicators */}
+      <div style={{ marginTop:'0.4rem', fontFamily:'Share Tech Mono,monospace', fontSize:'0.62rem', color:'#444', letterSpacing:'0.1em', textAlign:'center', display:'flex', gap:'2rem', justifyContent:'center', flexWrap:'wrap' }}>
+        <span>
+          AGENT SPEED:&nbsp;
+          {[...Array(10)].map((_,i) => (
+            <span key={i} style={{ color: i < playerSpeed ? '#60e0ff' : '#222', marginLeft:1 }}>{'█'}</span>
+          ))} {playerSpeed}/10
+        </span>
+        <span>
+          DRONE SPEED:&nbsp;
+          {[...Array(10)].map((_,i) => (
+            <span key={i} style={{ color: i < botSpeed ? '#ff4444' : '#222', marginLeft:1 }}>{'█'}</span>
+          ))} {botSpeed}/10
+        </span>
+      </div>
+    </div>
+  );
+}
